@@ -358,4 +358,3 @@ BOT_NAME: str = "Arunabha Elite Scalper"
 BOT_VERSION: str = "3.0.0"
 DEPLOYMENT: str = "Railway"
 REGION: str = os.getenv("RAILWAY_REGION", "asia-southeast1")
-
