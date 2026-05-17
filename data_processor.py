@@ -259,12 +259,13 @@ class IndicatorCalc:
             smoothed_plus[i] = smoothed_plus[i - 1] - smoothed_plus[i - 1] / period + plus_dm[i]
             smoothed_minus[i] = smoothed_minus[i - 1] - smoothed_minus[i - 1] / period + minus_dm[i]
 
-        plus_di = np.where(smoothed_tr > 0, 100 * smoothed_plus / smoothed_tr, 0)
-        minus_di = np.where(smoothed_tr > 0, 100 * smoothed_minus / smoothed_tr, 0)
+        plus_di = np.where(smoothed_tr > 0, 100.0 * smoothed_plus / np.where(smoothed_tr > 0, smoothed_tr, 1.0), 0.0)
+        minus_di = np.where(smoothed_tr > 0, 100.0 * smoothed_minus / np.where(smoothed_tr > 0, smoothed_tr, 1.0), 0.0)
+        di_sum = plus_di + minus_di
         dx = np.where(
-            (plus_di + minus_di) > 0,
-            100 * np.abs(plus_di - minus_di) / (plus_di + minus_di),
-            0,
+            di_sum > 0,
+            100.0 * np.abs(plus_di - minus_di) / np.where(di_sum > 0, di_sum, 1.0),
+            0.0,
         )
         adx_arr = np.full(n, 20.0)
         adx_arr[period * 2] = np.mean(dx[period: period * 2])
@@ -632,4 +633,5 @@ class DataProcessor:
                     buf.popleft()
         log.info("Evicted old candles (memory relief)")
 
-    def get_all_price
+    def get_all_prices(self) -> Dict[str, float]:
+        return dict(self._prices)
