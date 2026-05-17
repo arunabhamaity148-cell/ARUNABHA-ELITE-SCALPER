@@ -59,6 +59,14 @@ class SignalResult:
     expires_at: float = 0.0
     invalidated: bool = False
     invalidation_reason: str = ""
+    # Market breadth & new context fields
+    breadth_score: float = 0.5
+    extreme_funding_pct: float = 0.0
+    btc_dom_trend: str = ""
+    session: str = ""
+    session_mult: float = 1.0
+    funding_trend: str = ""
+    btc_correlation: float = 0.0
 
 
 @dataclass
@@ -82,6 +90,9 @@ class SignalEngine:
         ml_engine: MLEngine,
         telegram: TelegramBot,
         state: StateManager,
+        btc_dominance=None,
+        correlation_engine=None,
+        session_tracker=None,
     ):
         self.dp = data_processor
         self.orderflow = orderflow
@@ -91,7 +102,12 @@ class SignalEngine:
         self.ml = ml_engine
         self.telegram = telegram
         self.state = state
+        self.btc_dom = btc_dominance
+        self.corr = correlation_engine
+        self.session = session_tracker
         self._last_signal: Dict[str, float] = {}  # symbol → timestamp
+        # Trailing stop state: symbol → {sl, tp1_hit, tp2_hit, direction, atr}
+        self._trailing_state: Dict[str, dict] = {}
 
     # ═══════════════════════════════════════════
     # MAIN ENTRY POINT
@@ -188,8 +204,8 @@ class SignalEngine:
                 return None
 
             # ── STEP 10: Cross-exchange validation ──
-            from websocket_engine import WebsocketEngine
-            # Validation is done at WS level; skip additional check here
+            # Price divergence validated at WS layer (websocket_engine.validate_price)
+            # No additional check needed here — keep pipeline clean
 
             # ── GRADE & BUILD SIGNAL ──
             grade = self._grade(score)
@@ -198,6 +214,19 @@ class SignalEngine:
             size_info = self.risk.compute_size(
                 symbol, entry, sl, risk_pct, regime_result
             )
+
+            # ── Collect extra context fields ──
+            breadth = regime_result.breadth_score if regime_result else 0.5
+            # % of symbols with extreme funding
+            all_fundings = [self.dp.get_funding(s).rate for s in config.SYMBOLS]
+            extreme_funding_pct = sum(
+                1 for r in all_fundings if abs(r) >= config.FUNDING_EXTREME_LONG
+            ) / len(all_fundings) if all_fundings else 0.0
+            btc_dom_trend = self.btc_dom.get_trend() if self.btc_dom else ""
+            session_name = self.session.get_current_session() if self.session else ""
+            session_mult = self.session.get_size_multiplier() if self.session else 1.0
+            funding_trend = self.corr.get_funding_trend(symbol) if self.corr else "NEUTRAL"
+            btc_corr = self.corr.get_correlation_with_btc(symbol) if self.corr else 0.0
 
             signal = SignalResult(
                 symbol=symbol,
@@ -223,6 +252,13 @@ class SignalEngine:
                 funding_rate=funding.rate,
                 generated_at=time.time(),
                 expires_at=time.time() + config.SIGNAL_EXPIRY_MINUTES * 60,
+                breadth_score=breadth,
+                extreme_funding_pct=extreme_funding_pct,
+                btc_dom_trend=btc_dom_trend,
+                session=session_name,
+                session_mult=session_mult,
+                funding_trend=funding_trend,
+                btc_correlation=btc_corr,
             )
 
             self._last_signal[symbol] = time.time()
@@ -231,7 +267,8 @@ class SignalEngine:
         except Exception as e:
             log.error(f"Signal error {symbol}: {e}", exc_info=True)
             return None
-# ═══════════════════════════════════════════
+
+    # ═══════════════════════════════════════════
     # STEP 1: RAW SIGNAL DETECTION
     # ═══════════════════════════════════════════
 
@@ -451,9 +488,10 @@ class SignalEngine:
                 return BlockResult(True, "Breakout with no volume")
 
         # Close back inside level
-        prev_high = max(c.h for c in candles[-6:-2])
-        if direction == "LONG" and last.c < prev_high * 0.998:
-            return BlockResult(True, "Close failed above breakout level")
+        if len(candles) >= 6:
+            prev_high = max(c.h for c in candles[-6:-2])
+            if direction == "LONG" and last.c < prev_high * 0.998:
+                return BlockResult(True, "Close failed above breakout level")
 
         # Funding crowded in breakout direction
         if direction == "LONG" and funding.rate >= config.FUNDING_CROWDED:
@@ -461,11 +499,44 @@ class SignalEngine:
         if direction == "SHORT" and funding.rate <= -config.FUNDING_CROWDED:
             return BlockResult(True, f"Funding crowded short: {funding.rate:.5f}")
 
-        # CVD divergence
-        if of_snap and direction == "LONG" and of_snap.cvd_divergence:
-            pass  # CVD divergence is actually a signal for mean reversion, not a block here
-
         return BlockResult(False, "")
+
+    def _count_level_taps(self, candles: list, level: float, direction: str) -> int:
+        """
+        3-tap rule: count how many times price tested a level before breaking.
+        More taps = stronger breakout (not a fakeout).
+        direction LONG = count tests of resistance level
+        direction SHORT = count tests of support level
+        """
+        taps = 0
+        tol = config.THREE_TAP_TOLERANCE
+        lookback = candles[-config.THREE_TAP_LOOKBACK:] if len(candles) >= config.THREE_TAP_LOOKBACK else candles
+        for c in lookback[:-1]:  # exclude last candle (the breakout candle itself)
+            if direction == "LONG":
+                # High touched the level but closed below (each test)
+                if abs(c.h - level) / level <= tol and c.c < level:
+                    taps += 1
+            else:
+                # Low touched the level but closed above
+                if abs(c.l - level) / level <= tol and c.c > level:
+                    taps += 1
+        return taps
+
+    def _is_low_volume_node_breakout(self, symbol: str, price: float) -> bool:
+        """
+        Check if price is breaking out of a low-volume node in the VP.
+        Low volume nodes = price moves fast through them = stronger breakout.
+        """
+        of_snap = self.orderflow.get_snapshot(symbol)
+        if not of_snap or of_snap.poc_price == 0:
+            return False
+        # If price is between VAL and VAH but NOT near POC = mid-range, not a VP breakout
+        if of_snap.value_area_low < price < of_snap.value_area_high:
+            # Inside value area — check distance from POC
+            poc_dist = abs(price - of_snap.poc_price) / of_snap.poc_price
+            return poc_dist > 0.01  # breaking away from POC zone
+        # Outside value area = breaking out of single print (low vol node)
+        return True
 
     def _check_liquidity(self, symbol, entry, direction, liq_snap, ob) -> BlockResult:
         # Don't enter into a wall
@@ -603,7 +674,7 @@ class SignalEngine:
             vf_score += 5
         breakdown["volatility_fit"] = vf_score
 
-        # ── BTC Context (0-5) ──
+        # ── BTC Context + Dominance (0-5) ──
         btc_score = 0.0
         btc_bias, btc_breadth = self.regime.get_btc_context()
         if symbol != "BTCUSDT":
@@ -615,9 +686,45 @@ class SignalEngine:
                 btc_score += 2
             elif btc_breadth <= 0.35 and direction == "SHORT":
                 btc_score += 2
+
+            # BTC Dominance adjustment (bonus/penalty, not a hard block)
+            if self.btc_dom:
+                dom_trend = self.btc_dom.get_trend()
+                if direction == "LONG" and dom_trend == "FALLING":
+                    # Alt season — slightly boost alt longs
+                    btc_score = min(btc_score + 2, 5)
+                elif direction == "LONG" and dom_trend == "RISING":
+                    # BTC dominance rising = alt season ending
+                    btc_score = max(btc_score - 2, 0)
         breakdown["btc_context"] = btc_score
 
-        total = sum(breakdown.values())
+        # ── Session Filter bonus (not in 0-100 score, applied to size_adj later) ──
+        session_mult = 1.0
+        if self.session:
+            session_mult = self.session.get_size_multiplier()
+        breakdown["_session_mult"] = session_mult  # prefixed _ = meta, not scored
+
+        # ── Correlation penalty ──
+        corr_mult = 1.0
+        if self.corr:
+            corr_mult = self.corr.get_size_multiplier(symbol, direction)
+        breakdown["_corr_mult"] = corr_mult
+
+        # ── 3-tap bonus on BREAKOUT signals ──
+        if signal_type == "BREAKOUT" and len(candles) >= 6:
+            level = max(c.h for c in candles[-6:-2]) if direction == "LONG" else min(c.l for c in candles[-6:-2])
+            taps = self._count_level_taps(candles, level, direction)
+            if taps >= 3:
+                # 3+ taps = stronger breakout = add to structure score
+                breakdown["structure"] = min(breakdown.get("structure", 0) + 5, 15)
+
+        # ── Low Volume Node breakout bonus ──
+        if signal_type == "BREAKOUT":
+            if self._is_low_volume_node_breakout(symbol, price):
+                breakdown["volume"] = min(breakdown.get("volume", 0) + config.VP_LOW_VOLUME_BREAKOUT_BONUS, 15)
+
+        # Total (exclude _ meta keys)
+        total = sum(v for k, v in breakdown.items() if not k.startswith("_"))
         return round(min(total, 100), 1), breakdown
 
     # ═══════════════════════════════════════════
@@ -637,7 +744,6 @@ class SignalEngine:
         sl_buffer = atr * config.SL_BUFFER_ATR
 
         if direction == "LONG":
-            # SL below recent swing low or EMA support
             sl = entry - atr * 2 - sl_buffer
             sl = max(sl, entry * (1 - config.MAX_SL_DISTANCE))
             risk = entry - sl
@@ -661,6 +767,113 @@ class SignalEngine:
             round(tp2, 6),
             round(tp3, 6),
         )
+
+    # ═══════════════════════════════════════════
+    # TRAILING STOP MANAGEMENT
+    # ═══════════════════════════════════════════
+
+    async def update_trailing_stops(self):
+        """
+        Called every scan. Updates SL on active signals:
+        - After TP1: move SL to breakeven + 0.5 ATR
+        - After TP2: trail with EMA(9)
+        Sends Telegram update if SL moves.
+        """
+        active = self.state.get_active_signals()
+        for sig_dict in active:
+            symbol = sig_dict["symbol"]
+            try:
+                await self._update_signal_trail(symbol, sig_dict)
+            except Exception as e:
+                log.debug(f"Trail update error {symbol}: {e}")
+
+    async def _update_signal_trail(self, symbol: str, sig_dict: dict):
+        price = self.dp.get_price(symbol)
+        if price <= 0:
+            return
+
+        direction = sig_dict["direction"]
+        entry = sig_dict["entry_price"]
+        state_key = symbol
+
+        if state_key not in self._trailing_state:
+            # Initialise from active signal record
+            ind = self.dp.get_indicators(symbol, "15m")
+            atr = ind.atr if ind else entry * 0.005
+            self._trailing_state[state_key] = {
+                "direction": direction,
+                "entry": entry,
+                "current_sl": sig_dict.get("sl_price", entry),
+                "tp1": sig_dict.get("tp1_price", 0),
+                "tp2": sig_dict.get("tp2_price", 0),
+                "tp1_hit": False,
+                "tp2_hit": False,
+                "atr": atr,
+            }
+
+        ts = self._trailing_state[state_key]
+        ind = self.dp.get_indicators(symbol, "15m")
+        atr = ind.atr if ind and ind.atr > 0 else ts["atr"]
+        old_sl = ts["current_sl"]
+        new_sl = old_sl
+
+        if direction == "LONG":
+            # TP1 hit?
+            if not ts["tp1_hit"] and ts["tp1"] > 0 and price >= ts["tp1"]:
+                ts["tp1_hit"] = True
+                # Move SL to breakeven + 0.5 ATR
+                new_sl = max(old_sl, entry + atr * config.TRAIL_SL_AFTER_TP1_ATR_MULT)
+                log.info(f"[{symbol}] TP1 hit — SL moved to {new_sl:.4f}")
+
+            # TP2 hit?
+            if ts["tp1_hit"] and not ts["tp2_hit"] and ts["tp2"] > 0 and price >= ts["tp2"]:
+                ts["tp2_hit"] = True
+                log.info(f"[{symbol}] TP2 hit — trailing with EMA9")
+
+            # Trail with EMA9 after TP2
+            if ts["tp2_hit"] and config.TRAIL_SL_AFTER_TP2_USE_EMA9 and ind:
+                ema9_sl = ind.ema9 - atr * 0.3
+                new_sl = max(old_sl, ema9_sl)
+
+        else:  # SHORT
+            if not ts["tp1_hit"] and ts["tp1"] > 0 and price <= ts["tp1"]:
+                ts["tp1_hit"] = True
+                new_sl = min(old_sl, entry - atr * config.TRAIL_SL_AFTER_TP1_ATR_MULT)
+                log.info(f"[{symbol}] TP1 hit — SL moved to {new_sl:.4f}")
+
+            if ts["tp1_hit"] and not ts["tp2_hit"] and ts["tp2"] > 0 and price <= ts["tp2"]:
+                ts["tp2_hit"] = True
+                log.info(f"[{symbol}] TP2 hit — trailing with EMA9")
+
+            if ts["tp2_hit"] and config.TRAIL_SL_AFTER_TP2_USE_EMA9 and ind:
+                ema9_sl = ind.ema9 + atr * 0.3
+                new_sl = min(old_sl, ema9_sl)
+
+        # If SL moved, send update
+        sl_moved = abs(new_sl - old_sl) > entry * 0.0001
+        if sl_moved:
+            ts["current_sl"] = new_sl
+            await self._send_trail_update(symbol, direction, new_sl, ts)
+
+    async def _send_trail_update(self, symbol: str, direction: str, new_sl: float, ts: dict):
+        stage = "TP2 trail (EMA9)" if ts["tp2_hit"] else "TP1 hit (breakeven)"
+        msg = (
+            f"🔄 <b>TRAIL UPDATE — {symbol}</b>\n"
+            f"Stage: <code>{stage}</code>\n"
+            f"Direction: <b>{direction}</b>\n"
+            f"New SL: <code>{new_sl:.4f}</code>\n"
+            f"Entry: <code>{ts['entry']:.4f}</code>\n"
+            f"TP1 hit: {'✅' if ts['tp1_hit'] else '❌'} | "
+            f"TP2 hit: {'✅' if ts['tp2_hit'] else '❌'}"
+        )
+        try:
+            await self.telegram.send_alert(msg, priority="normal")
+        except Exception as e:
+            log.debug(f"Trail alert error: {e}")
+
+    def clear_trailing_state(self, symbol: str):
+        """Call when signal closes (SL/TP hit)."""
+        self._trailing_state.pop(symbol, None)
 
     # ═══════════════════════════════════════════
     # ML FEATURES
