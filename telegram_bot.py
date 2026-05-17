@@ -131,13 +131,53 @@ class TelegramBot:
             f"📈 Volume: <code>{signal.volume_regime}</code>",
             f"💸 Funding: <code>{signal.funding_rate*100:.4f}%</code>",
             f"",
-            f"<b>🔢 Score Breakdown</b>",
         ]
 
-        # Score breakdown
+        # ── Market Breadth block ──
+        breadth_pct = getattr(signal, "breadth_score", None)
+        if breadth_pct is not None:
+            bull_pct = int(breadth_pct * 100)
+            breadth_bar = "█" * (bull_pct // 10) + "░" * (10 - bull_pct // 10)
+            breadth_emoji = "🐂" if bull_pct >= 60 else "🐻" if bull_pct <= 40 else "🔄"
+            lines.append(f"{breadth_emoji} Breadth: <b>{bull_pct}% bullish</b> {breadth_bar}")
+
+        extreme_funding_pct = getattr(signal, "extreme_funding_pct", None)
+        if extreme_funding_pct is not None:
+            lines.append(f"💸 Extreme funding: <b>{int(extreme_funding_pct*100)}% symbols</b>")
+
+        btc_dom_trend = getattr(signal, "btc_dom_trend", "")
+        if btc_dom_trend:
+            dom_emoji = "📈" if btc_dom_trend == "RISING" else "📉" if btc_dom_trend == "FALLING" else "➡️"
+            lines.append(f"{dom_emoji} BTC.D trend: <code>{btc_dom_trend}</code>")
+
+        session_name = getattr(signal, "session", "")
+        session_mult = getattr(signal, "session_mult", 1.0)
+        if session_name:
+            lines.append(f"🕐 Session: <code>{session_name}</code> ({session_mult:.2f}x size)")
+
+        funding_trend = getattr(signal, "funding_trend", "")
+        if funding_trend and funding_trend != "NEUTRAL":
+            ft_emoji = "⬆️" if funding_trend == "RISING" else "⬇️"
+            lines.append(f"{ft_emoji} Funding trend: <code>{funding_trend}</code>")
+
+        corr_with_btc = getattr(signal, "btc_correlation", None)
+        if corr_with_btc is not None:
+            corr_emoji = "🔴" if abs(corr_with_btc) >= 0.85 else "🟡" if abs(corr_with_btc) >= 0.60 else "🟢"
+            lines.append(f"{corr_emoji} BTC correlation: <code>{corr_with_btc:+.2f}</code>")
+
+        lines.extend([
+            f"",
+            f"<b>🔢 Score Breakdown</b>",
+        ])
+
+        # Score breakdown (skip meta keys prefixed with _)
         for k, v in signal.score_breakdown.items():
+            if k.startswith("_"):
+                continue
             label = k.replace("_", " ").title()
-            bar = "█" * int(v / 5) + "░" * (4 - int(v / 5))
+            max_v = 20 if k == "trend_alignment" else 15 if k in ("momentum", "volume", "structure") else 10 if k in ("orderbook", "funding", "volatility_fit") else 5
+            filled = min(int(v / max_v * 4), 4)
+            bar = "█" * filled + "░" * (4 - filled)
             lines.append(f"  {label}: <code>{v:.0f}</code> {bar}")
 
         lines.extend([
