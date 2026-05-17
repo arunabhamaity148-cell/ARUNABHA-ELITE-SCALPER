@@ -22,7 +22,8 @@ TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "elite2024")
 REDIS_URL: str = os.getenv("REDIS_URL", "")
-ACCOUNT_BALANCE_USDT: float = float(os.getenv("ACCOUNT_BALANCE_USDT", "1000"))
+_bal_raw = os.getenv("ACCOUNT_BALANCE_USDT", "").strip()
+ACCOUNT_BALANCE_USDT: float = float(_bal_raw) if _bal_raw else 1000.0
 
 # ═══════════════════════════════════════════════
 # SYMBOLS & TIMEFRAMES
@@ -343,6 +344,56 @@ SIGNAL_COLORS: Dict[str, str] = {
     "TIER3": "#2196F3",
     "BLOCKED": "#9E9E9E",
 }
+
+# ═══════════════════════════════════════════════
+# SESSION TRACKING
+# ═══════════════════════════════════════════════
+SESSION_ASIAN_START_UTC: int = 0
+SESSION_ASIAN_END_UTC: int = 8
+SESSION_LONDON_START_UTC: int = 8
+SESSION_LONDON_END_UTC: int = 16
+SESSION_NY_START_UTC: int = 16
+SESSION_NY_END_UTC: int = 24
+SESSION_ASIAN_SIZE_MULT: float = 0.75
+SESSION_LONDON_SIZE_MULT: float = 1.00
+SESSION_NY_SIZE_MULT: float = 1.00
+SESSION_MIN_TRADES_FOR_STATS: int = 20
+
+# ═══════════════════════════════════════════════
+# FUNDING RATE TREND
+# ═══════════════════════════════════════════════
+FUNDING_TREND_LOOKBACK: int = 24
+FUNDING_RISING_THRESHOLD: float = 0.0002
+FUNDING_FALLING_THRESHOLD: float = -0.0002
+
+# ═══════════════════════════════════════════════
+# BTC DOMINANCE
+# ═══════════════════════════════════════════════
+BTC_DOM_RISING_ALT_LONG_MULT: float = 0.75
+BTC_DOM_FALLING_ALT_LONG_MULT: float = 1.20
+BTC_DOM_CHANGE_THRESHOLD: float = 0.005
+BTC_DOM_FETCH_INTERVAL: int = 300
+
+# ═══════════════════════════════════════════════
+# CORRELATION ENGINE
+# ═══════════════════════════════════════════════
+CORRELATION_LOOKBACK: int = 20
+CORRELATION_HIGH: float = 0.85
+CORRELATION_PORTFOLIO_LIMIT: float = 0.70
+CORRELATION_SIZE_REDUCTION: float = 0.50
+
+# ═══════════════════════════════════════════════
+# TRAILING STOP
+# ═══════════════════════════════════════════════
+TRAIL_SL_AFTER_TP1_ATR_MULT: float = 0.5
+TRAIL_SL_AFTER_TP2_USE_EMA9: bool = True
+
+# ═══════════════════════════════════════════════
+# FAKEOUT ENHANCEMENTS
+# ═══════════════════════════════════════════════
+THREE_TAP_LOOKBACK: int = 30
+THREE_TAP_TOLERANCE: float = 0.002
+VP_LOW_VOLUME_BREAKOUT_BONUS: int = 5
 
 # ═══════════════════════════════════════════════
 # LOGGING
