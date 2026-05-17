@@ -213,7 +213,71 @@ class DeployCheck:
         except Exception as e:
             self._record("Config validation", False, str(e))
 
-    def check_dependencies(self):
+    def check_config(self):
+        log.info("\n── CONFIG VALIDATION ──")
+        try:
+            import config as cfg
+
+            # Score weights sum
+            weight_sum = (
+                cfg.WEIGHT_TREND_ALIGNMENT + cfg.WEIGHT_MOMENTUM + cfg.WEIGHT_VOLUME +
+                cfg.WEIGHT_STRUCTURE + cfg.WEIGHT_ORDERBOOK + cfg.WEIGHT_FUNDING +
+                cfg.WEIGHT_VOLATILITY_FIT + cfg.WEIGHT_BTC_CONTEXT
+            )
+            self._record("Score weights sum to 100", weight_sum == 100, f"Sum={weight_sum}")
+            self._record("MAX_RISK sane", 0 < cfg.MAX_RISK_PER_TRADE <= 0.05, f"{cfg.MAX_RISK_PER_TRADE:.0%}")
+            self._record("MAX_LEVERAGE sane", 1 <= cfg.MAX_LEVERAGE <= 10, f"{cfg.MAX_LEVERAGE}x")
+            self._record("Symbols not empty", len(cfg.SYMBOLS) > 0, f"{len(cfg.SYMBOLS)} symbols")
+            self._record("POLUSDT replaces MATICUSDT",
+                         "POLUSDT" in cfg.SYMBOLS and "MATICUSDT" not in cfg.SYMBOLS,
+                         "Symbol list correct")
+            self._record("ACCOUNT_BALANCE_USDT non-zero",
+                         cfg.ACCOUNT_BALANCE_USDT > 0, f"${cfg.ACCOUNT_BALANCE_USDT:.2f}")
+            self._record("Session constants present",
+                         hasattr(cfg, "SESSION_ASIAN_SIZE_MULT"), "ok")
+            self._record("BTC DOM constants present",
+                         hasattr(cfg, "BTC_DOM_RISING_ALT_LONG_MULT"), "ok")
+            self._record("Correlation constants present",
+                         hasattr(cfg, "CORRELATION_HIGH"), "ok")
+            self._record("Trailing stop constants present",
+                         hasattr(cfg, "TRAIL_SL_AFTER_TP1_ATR_MULT"), "ok")
+            self._record("3-tap constants present",
+                         hasattr(cfg, "THREE_TAP_LOOKBACK"), "ok")
+            self._record("Funding trend constants present",
+                         hasattr(cfg, "FUNDING_TREND_LOOKBACK"), "ok")
+
+        except ImportError:
+            self._record("Config import", False, "config.py not found")
+        except Exception as e:
+            self._record("Config validation", False, str(e))
+
+    def check_new_files(self):
+        log.info("\n── NEW MODULE FILES ──")
+        required_files = [
+            "btc_dominance.py",
+            "correlation_engine.py",
+            "session_tracker.py",
+            "events_calendar.py",
+            "ml_engine.py",
+            "state_manager.py",
+            "monitoring.py",
+            "cache_manager.py",
+            "utils.py",
+            "backtest_engine.py",
+            "liquidity_engine.py",
+            "market_regime_engine.py",
+            "orderflow_engine.py",
+            "websocket_engine.py",
+            "data_processor.py",
+            "signal_engine.py",
+            "risk_engine.py",
+            "telegram_bot.py",
+            "main.py",
+            "config.py",
+        ]
+        for fname in required_files:
+            exists = os.path.exists(fname)
+            self._record(f"file: {fname}", exists, "present" if exists else "MISSING")
         log.info("\n── PYTHON DEPENDENCIES ──")
         deps = [
             ("aiohttp", "aiohttp"),
@@ -272,6 +336,7 @@ async def main():
 
     checker.check_env_vars()
     checker.check_config()
+    checker.check_new_files()
     checker.check_dependencies()
     checker.check_indicator_math()
 
