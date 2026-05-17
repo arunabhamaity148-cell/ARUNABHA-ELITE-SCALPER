@@ -18,13 +18,17 @@ from typing import Optional
 import psutil
 
 import config
+from btc_dominance import BTCDominanceTracker
+from correlation_engine import CorrelationEngine
 from data_processor import DataProcessor
+from events_calendar import EventsCalendar
 from liquidity_engine import LiquidityEngine
 from market_regime_engine import MarketRegimeEngine
 from ml_engine import MLEngine
 from monitoring import MonitoringEngine
 from orderflow_engine import OrderflowEngine
 from risk_engine import RiskEngine
+from session_tracker import SessionTracker
 from signal_engine import SignalEngine
 from state_manager import StateManager
 from telegram_bot import TelegramBot
@@ -83,6 +87,10 @@ class EliteScalper:
         self.risk_engine: Optional[RiskEngine] = None
         self.ml_engine: Optional[MLEngine] = None
         self.monitor: Optional[MonitoringEngine] = None
+        self.events_calendar: Optional[EventsCalendar] = None
+        self.btc_dominance: Optional[BTCDominanceTracker] = None
+        self.correlation_engine: Optional[CorrelationEngine] = None
+        self.session_tracker: Optional[SessionTracker] = None
 
     # ───────────────────────────────────────────
     # STARTUP
@@ -136,6 +144,25 @@ class EliteScalper:
             self.risk_engine = RiskEngine(self.state)
             self.log.info("✅ Risk engine ready")
 
+            # 10a. Events Calendar → inject into risk engine
+            self.events_calendar = EventsCalendar()
+            await self.events_calendar.refresh()
+            self.risk_engine.set_events_calendar(self.events_calendar)
+            self.log.info("✅ Events calendar ready")
+
+            # 10b. Session tracker
+            self.session_tracker = SessionTracker()
+            self.log.info("✅ Session tracker ready")
+
+            # 10c. BTC Dominance tracker
+            self.btc_dominance = BTCDominanceTracker()
+            await self.btc_dominance.fetch()
+            self.log.info("✅ BTC Dominance tracker ready")
+
+            # 10d. Correlation engine
+            self.correlation_engine = CorrelationEngine(self.data_processor)
+            self.log.info("✅ Correlation engine ready")
+
             # 11. Signal engine
             self.signal_engine = SignalEngine(
                 data_processor=self.data_processor,
@@ -146,6 +173,9 @@ class EliteScalper:
                 ml_engine=self.ml_engine,
                 telegram=self.telegram,
                 state=self.state,
+                btc_dominance=self.btc_dominance,
+                correlation_engine=self.correlation_engine,
+                session_tracker=self.session_tracker,
             )
             self.log.info("✅ Signal engine ready")
 
@@ -217,6 +247,12 @@ class EliteScalper:
         if not self.risk_engine.can_scan(now):
             return
 
+        # 1b. Update trailing stops on active signals
+        try:
+            await self.signal_engine.update_trailing_stops()
+        except Exception as e:
+            self.log.debug(f"Trailing stop update error: {e}")
+
         # 2. Update regime (once per scan, all symbols)
         regimes = {}
         for symbol in config.SYMBOLS:
@@ -252,6 +288,18 @@ class EliteScalper:
         # 5. Update state
         self.state.update_scan(scan_count, len(signals))
 
+        # 6. Feed funding rates into correlation engine for trend tracking
+        if self.correlation_engine:
+            try:
+                now_ts = datetime.now(timezone.utc).timestamp()
+                for sym in config.SYMBOLS:
+                    fd = self.data_processor.get_funding(sym)
+                    if fd.rate != 0.0:
+                        self.correlation_engine.update_funding(sym, fd.rate, now_ts)
+                self.correlation_engine.rebuild_matrix()
+            except Exception as e:
+                self.log.debug(f"Correlation update error: {e}")
+
         if scan_count % 10 == 0:
             self.log.info(
                 f"Scan #{scan_count} | Signals: {len(signals)} | "
@@ -267,6 +315,11 @@ class EliteScalper:
             ("ws_engine", self.ws_engine.run()),
             ("orderflow", self.orderflow.run()),
             ("monitor", self.monitor.run()),
+            ("rest_polling", self.data_processor.start_rest_polling()),
+            ("telegram_polling", self.telegram.start_polling()),
+            ("btc_dominance", self.btc_dominance.run()),
+            ("events_calendar", self._events_refresh_loop()),
+            ("session_tracker", self.session_tracker.run()),
             ("memory_watchdog", self._memory_watchdog()),
             ("main_loop", self.main_loop()),
         ]
@@ -274,6 +327,15 @@ class EliteScalper:
             task = asyncio.create_task(coro, name=name)
             self._tasks.append(task)
             self.log.info(f"Started task: {name}")
+
+    async def _events_refresh_loop(self):
+        """Refresh economic calendar every hour."""
+        while not self._shutdown_event.is_set():
+            try:
+                await self.events_calendar.refresh()
+            except Exception as e:
+                self.log.debug(f"Events refresh error: {e}")
+            await asyncio.sleep(3600)
 
     # ───────────────────────────────────────────
     # MEMORY WATCHDOG
