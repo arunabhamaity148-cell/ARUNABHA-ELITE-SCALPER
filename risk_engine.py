@@ -29,6 +29,11 @@ class SizeInfo:
 class RiskEngine:
     def __init__(self, state: StateManager):
         self.state = state
+        self._events_calendar = None   # injected after init
+
+    def set_events_calendar(self, cal):
+        """Inject EventsCalendar after construction (avoids circular import)."""
+        self._events_calendar = cal
 
     # ═══════════════════════════════════════════
     # CAN WE SCAN AT ALL?
@@ -177,7 +182,18 @@ class RiskEngine:
             risk_pct *= config.WEEKEND_SIZE_REDUCTION
             reason_parts.append("Weekend → 75%")
 
-        # 5. Regime size adjustment
+        # 5. Pre-event reduction (FOMC, CPI, NFP, etc.)
+        if self._events_calendar:
+            try:
+                is_pre, event = self._events_calendar.is_pre_event()
+                if is_pre:
+                    risk_pct *= config.PRE_EVENT_REDUCTION
+                    evt_name = event.title[:30] if event else "High-impact event"
+                    reason_parts.append(f"Pre-event ({evt_name}) → 50%")
+            except Exception:
+                pass
+
+        # 6. Regime size adjustment
         if regime and hasattr(regime, "size_adjustment"):
             risk_pct *= regime.size_adjustment
 
