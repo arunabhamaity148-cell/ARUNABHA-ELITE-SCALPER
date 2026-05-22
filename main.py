@@ -30,6 +30,7 @@ from orderflow_engine import OrderflowEngine
 from risk_engine import RiskEngine
 from session_tracker import SessionTracker
 from signal_engine import SignalEngine
+from smc_engine import SMCEngine
 from state_manager import StateManager
 from telegram_bot import TelegramBot
 from websocket_engine import WebsocketEngine
@@ -91,6 +92,7 @@ class EliteScalper:
         self.btc_dominance: Optional[BTCDominanceTracker] = None
         self.correlation_engine: Optional[CorrelationEngine] = None
         self.session_tracker: Optional[SessionTracker] = None
+        self.smc_engine: Optional[SMCEngine] = None
 
     # ───────────────────────────────────────────
     # STARTUP
@@ -163,6 +165,10 @@ class EliteScalper:
             self.correlation_engine = CorrelationEngine(self.data_processor)
             self.log.info("✅ Correlation engine ready")
 
+            # 10e. SMC engine (Orderblock, FVG, Breaker, L/S Ratio, Asian Range)
+            self.smc_engine = SMCEngine(self.data_processor)
+            self.log.info("✅ SMC engine ready")
+
             # 11. Signal engine
             self.signal_engine = SignalEngine(
                 data_processor=self.data_processor,
@@ -176,6 +182,7 @@ class EliteScalper:
                 btc_dominance=self.btc_dominance,
                 correlation_engine=self.correlation_engine,
                 session_tracker=self.session_tracker,
+                smc_engine=self.smc_engine,
             )
             self.log.info("✅ Signal engine ready")
 
@@ -321,6 +328,8 @@ class EliteScalper:
             ("events_calendar", self._events_refresh_loop()),
             ("session_tracker", self.session_tracker.run()),
             ("memory_watchdog", self._memory_watchdog()),
+            ("smc_polling", self.smc_engine.start_polling()),
+            ("asian_range_reset", self._asian_range_reset_loop()),
             ("main_loop", self.main_loop()),
         ]
         for name, coro in tasks:
@@ -336,6 +345,29 @@ class EliteScalper:
             except Exception as e:
                 self.log.debug(f"Events refresh error: {e}")
             await asyncio.sleep(3600)
+
+    async def _asian_range_reset_loop(self):
+        """Reset Asian session range at 00:00 UTC daily."""
+        import datetime
+        while not self._shutdown_event.is_set():
+            try:
+                now = datetime.datetime.utcnow()
+                # Sleep until next 00:00 UTC
+                next_midnight = (now + datetime.timedelta(days=1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+                sleep_secs = (next_midnight - now).total_seconds()
+                await asyncio.sleep(sleep_secs)
+                # Reset all symbols
+                if self.smc_engine:
+                    for sym in config.SYMBOLS:
+                        self.smc_engine.reset_asian_session(sym)
+                    self.log.info("Asian session range reset for all symbols")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.log.debug(f"Asian range reset error: {e}")
+                await asyncio.sleep(60)
 
     # ───────────────────────────────────────────
     # MEMORY WATCHDOG
