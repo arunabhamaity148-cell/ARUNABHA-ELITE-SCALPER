@@ -19,6 +19,7 @@ from market_regime_engine import MarketRegimeEngine, RegimeResult, RegimeType
 from ml_engine import MLEngine
 from orderflow_engine import OrderflowEngine, OrderflowSnapshot
 from risk_engine import RiskEngine
+from smc_engine import SMCEngine, SMCSnapshot
 from state_manager import StateManager
 from telegram_bot import TelegramBot
 
@@ -93,6 +94,7 @@ class SignalEngine:
         btc_dominance=None,
         correlation_engine=None,
         session_tracker=None,
+        smc_engine=None,
     ):
         self.dp = data_processor
         self.orderflow = orderflow
@@ -105,6 +107,7 @@ class SignalEngine:
         self.btc_dom = btc_dominance
         self.corr = correlation_engine
         self.session = session_tracker
+        self.smc = smc_engine  # SMCEngine instance (optional, graceful if None)
         self._last_signal: Dict[str, float] = {}  # symbol → timestamp
         # Trailing stop state: symbol → {sl, tp1_hit, tp2_hit, direction, atr}
         self._trailing_state: Dict[str, dict] = {}
@@ -135,6 +138,13 @@ class SignalEngine:
             liq_snap = self.liquidity.get_snapshot(symbol)
             funding = self.dp.get_funding(symbol)
             ob = self.dp.get_orderbook(symbol)
+
+            # ── SMC Engine update ──
+            smc_snap = None
+            if self.smc:
+                await self.smc.update(symbol)
+                self.smc.update_asian_range(symbol)
+                smc_snap = self.smc.get_snapshot(symbol)
 
             if not ind_15m or not ind_1h or price <= 0:
                 return None
@@ -178,6 +188,14 @@ class SignalEngine:
                 log.debug(f"[{symbol}] BLOCKED correlation: {block.reason}")
                 return None
 
+            # ── STEP 6.5: SMC direction alignment check ──
+            if self.smc and smc_snap:
+                smc_aligned, smc_reason = self.smc.get_smc_direction_bias(symbol, direction)
+                if not smc_aligned:
+                    log.debug(f"[{symbol}] BLOCKED smc: {smc_reason}")
+                    return None
+                log.debug(f"[{symbol}] SMC check: {smc_reason} score={smc_snap.total_score:.1f}")
+
             # ── STEP 7: Risk check ──
             block = self.risk.pre_signal_check(symbol, direction)
             if block:
@@ -190,6 +208,7 @@ class SignalEngine:
                 ind_15m, ind_1h, ind_4h, ind_5m,
                 of_snap, liq_snap, regime_result,
                 funding, ob, price, candles_15m,
+                smc_snap=smc_snap,
             )
 
             if score < config.SCORE_MINIMUM:
@@ -570,6 +589,7 @@ class SignalEngine:
         self, symbol, direction, signal_type,
         ind_15m, ind_1h, ind_4h, ind_5m,
         of_snap, liq_snap, regime, funding, ob, price, candles,
+        smc_snap=None,
     ) -> Tuple[float, Dict[str, float]]:
         breakdown = {}
 
@@ -722,6 +742,35 @@ class SignalEngine:
         if signal_type == "BREAKOUT":
             if self._is_low_volume_node_breakout(symbol, price):
                 breakdown["volume"] = min(breakdown.get("volume", 0) + config.VP_LOW_VOLUME_BREAKOUT_BONUS, 15)
+
+        # ── SMC Score (0-40 raw → scaled to max 20 bonus) ──
+        # We scale down so SMC doesn't dominate the 0-100 score system.
+        # SMC max=40 raw → contributes max 20 pts to final score.
+        if smc_snap and smc_snap.updated_at > 0:
+            smc_raw = smc_snap.total_score          # 0-40
+            smc_bonus = round(smc_raw * 0.5, 2)    # scale to 0-20
+
+            # Direction-specific sub-scores in breakdown for transparency
+            if direction == "LONG":
+                ob_contrib = smc_snap.ob_score if (
+                    smc_snap.nearest_ob_bull and not smc_snap.nearest_ob_bull.mitigated
+                ) else 0.0
+            else:
+                ob_contrib = smc_snap.ob_score if (
+                    smc_snap.nearest_ob_bear and not smc_snap.nearest_ob_bear.mitigated
+                ) else 0.0
+
+            breakdown["smc_orderblock"] = round(ob_contrib * 0.5, 2)
+            breakdown["smc_fvg"] = round(smc_snap.fvg_score * 0.5, 2)
+            breakdown["smc_breaker"] = round(smc_snap.breaker_score * 0.5, 2)
+            breakdown["smc_ls_ratio"] = round(smc_snap.ls_score * 0.5, 2)
+            breakdown["smc_asian_range"] = round(smc_snap.asian_score * 0.5, 2)
+
+            log.debug(
+                f"[{symbol}] SMC: ob={ob_contrib:.1f} fvg={smc_snap.fvg_score:.1f} "
+                f"breaker={smc_snap.breaker_score:.1f} ls={smc_snap.ls_score:.1f} "
+                f"asian={smc_snap.asian_score:.1f} bonus={smc_bonus:.1f}"
+            )
 
         # Total (exclude _ meta keys)
         total = sum(v for k, v in breakdown.items() if not k.startswith("_"))
