@@ -1,344 +1,507 @@
 """
-ARUNABHA ELITE SCALPER v3.0
-FILE 12/18: state_manager.py
-Persistent runtime state — balance, drawdown, P&L, active signals, scan metrics
-Saves to JSON (Railway ephemeral FS acceptable; Redis optional)
+ARUNABHA MANUAL SCALPER v4.0
+FILE: state_manager.py  (UPGRADED from v3)
+
+Critical changes vs v3:
+- Redis persistence for risk state (survives Railway restarts)
+- Pair-level cooldowns after failed trades
+- Narrative-level cooldowns after repeated failures
+- Rotation statistics tracking
+- Signal outcome logging for ML training
 """
 
+import asyncio
 import json
 import logging
-import os
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import config
 
-log = logging.getLogger("elite.state")
-
-STATE_FILE = "bot_state.json"
+log = logging.getLogger("scalper.state")
 
 
 @dataclass
-class SignalRecord:
+class TradeOutcome:
+    signal_id: str
     symbol: str
     direction: str
-    grade: str
     signal_type: str
+    grade: str
     entry_price: float
     sl_price: float
     tp1_price: float
-    risk_pct: float
-    risk_usdt: float
-    size_usdt: float
-    generated_at: float
-    expires_at: float
-    status: str = "ACTIVE"          # ACTIVE / HIT_TP1 / HIT_TP2 / HIT_TP3 / HIT_SL / EXPIRED
-    closed_at: float = 0.0
-    pnl_usdt: float = 0.0
-    ml_features: List[float] = field(default_factory=list)
+    exit_price: float
+    outcome: str          # TP1 / TP2 / TP3 / SL / MANUAL
+    pnl_pct: float
+    pnl_r: float          # R multiple
+    hold_minutes: float
+    attention_score: float
+    narrative: str
+    session: str
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class PairCooldown:
+    symbol: str
+    reason: str           # SL_HIT / NARRATIVE_FAIL / MANUAL
+    cooldown_until: float
+    loss_count: int = 1
+
+
+@dataclass
+class NarrativeCooldown:
+    narrative: str
+    failure_count: int
+    cooldown_until: float
 
 
 class StateManager:
-    def __init__(self):
-        # Account
-        self.current_balance_usdt: float = config.ACCOUNT_BALANCE_USDT
-        self.peak_balance_usdt: float = config.ACCOUNT_BALANCE_USDT
-        self.drawdown_pct: float = 0.0
+    """
+    Tracks all runtime state.
+    Critical state is persisted to Redis every 60s and on each trade close.
+    Non-critical state (websocket stats, etc.) is in-memory only.
+    """
 
-        # Daily / weekly / monthly P&L (as fraction)
+    def __init__(self):
+        self._redis = None
+
+        # ── Risk state (MUST be persisted) ──
+        self.daily_pnl: float = 0.0
         self.daily_loss_pct: float = 0.0
         self.weekly_loss_pct: float = 0.0
         self.monthly_loss_pct: float = 0.0
-        self._daily_start_balance: float = config.ACCOUNT_BALANCE_USDT
-        self._weekly_start_balance: float = config.ACCOUNT_BALANCE_USDT
-        self._monthly_start_balance: float = config.ACCOUNT_BALANCE_USDT
-        self._day_start_ts: float = 0.0
-        self._week_start_ts: float = 0.0
-        self._month_start_ts: float = 0.0
-
-        # Loss streak
         self.consecutive_losses: int = 0
-        self.last_loss_ts: float = 0.0
+        self.consecutive_wins: int = 0
+        self.daily_trades: int = 0
+        self.drawdown_peak: float = 0.0
+        self.current_drawdown: float = 0.0
 
-        # Kill switch
-        self.kill_switch_active: bool = False
+        # Cooldowns
+        self._trading_pause_until: float = 0.0
+        self._pair_cooldowns: Dict[str, PairCooldown] = {}
+        self._narrative_cooldowns: Dict[str, NarrativeCooldown] = {}
 
-        # Signals
-        self._active_signals: Dict[str, SignalRecord] = {}
-        self._signal_history: List[SignalRecord] = []
+        # Active signals (non-persisted — rebuilt from Telegram history if needed)
+        self._active_signals: Dict[str, object] = {}
 
-        # Stats
-        self.total_signals: int = 0
-        self.total_wins: int = 0
-        self.total_losses: int = 0
-        self.scan_count: int = 0
-        self._started_at: float = time.time()
+        # Trade history (persisted, rolling window)
+        self._closed_trades: List[TradeOutcome] = []
+        self._MAX_CLOSED_TRADES: int = 500
+
+        # Rotation stats (non-critical)
+        self._universe_history: List[List[str]] = []
+        self._attention_history: Dict[str, List[float]] = {}
+
+        # Day tracking
+        self._day_start_ts: float = self._get_day_start()
+        self._week_start_ts: float = self._get_week_start()
+
+        # Persistence
+        self._last_persist: float = 0.0
+        self._persist_interval: float = 60.0
+        self._shutdown = asyncio.Event()
+        self._lock = asyncio.Lock()
 
     # ═══════════════════════════════════════════
-    # LOAD / SAVE
+    # REDIS SETUP
     # ═══════════════════════════════════════════
 
-    async def load(self):
-        if not os.path.exists(STATE_FILE):
-            log.info("No saved state — starting fresh")
-            self._reset_period_timestamps()
+    async def connect_redis(self, redis_url: str):
+        if not redis_url:
+            log.warning("No REDIS_URL — state will NOT persist across restarts")
+            return
+        try:
+            import aioredis
+            self._redis = await aioredis.from_url(redis_url, decode_responses=True)
+            await self._redis.ping()
+            log.info("Redis connected — state persistence enabled")
+        except ImportError:
+            log.warning("aioredis not installed — no persistence")
+        except Exception as e:
+            log.warning(f"Redis connection failed: {e} — running without persistence")
+
+    # ═══════════════════════════════════════════
+    # STARTUP STATE RESTORE
+    # ═══════════════════════════════════════════
+
+    async def restore_on_startup(self):
+        """
+        Restore critical risk state from Redis after restart.
+        Only restores if state is fresh (< 1 hour old).
+        """
+        if not self._redis:
             return
 
         try:
-            with open(STATE_FILE, "r") as f:
-                data = json.load(f)
+            raw = await self._redis.get("scalper_v4:state")
+            if not raw:
+                log.info("No saved state found — starting fresh")
+                return
 
-            self.current_balance_usdt = data.get("current_balance_usdt", config.ACCOUNT_BALANCE_USDT)
-            self.peak_balance_usdt = data.get("peak_balance_usdt", self.current_balance_usdt)
+            data = json.loads(raw)
+            saved_at = data.get("saved_at", 0)
+            age_hours = (time.time() - saved_at) / 3600
+
+            if age_hours > 2.0:
+                log.info(f"Saved state is {age_hours:.1f}h old — too stale, starting fresh")
+                return
+
+            # Restore risk counters
+            self.daily_pnl = data.get("daily_pnl", 0.0)
+            self.daily_loss_pct = data.get("daily_loss_pct", 0.0)
+            self.weekly_loss_pct = data.get("weekly_loss_pct", 0.0)
+            self.monthly_loss_pct = data.get("monthly_loss_pct", 0.0)
             self.consecutive_losses = data.get("consecutive_losses", 0)
-            self.last_loss_ts = data.get("last_loss_ts", 0.0)
-            self.kill_switch_active = data.get("kill_switch_active", False)
-            self.total_signals = data.get("total_signals", 0)
-            self.total_wins = data.get("total_wins", 0)
-            self.total_losses = data.get("total_losses", 0)
-            self._day_start_ts = data.get("day_start_ts", 0.0)
-            self._week_start_ts = data.get("week_start_ts", 0.0)
-            self._month_start_ts = data.get("month_start_ts", 0.0)
-            self._daily_start_balance = data.get("daily_start_balance", self.current_balance_usdt)
-            self._weekly_start_balance = data.get("weekly_start_balance", self.current_balance_usdt)
-            self._monthly_start_balance = data.get("monthly_start_balance", self.current_balance_usdt)
+            self.consecutive_wins = data.get("consecutive_wins", 0)
+            self.daily_trades = data.get("daily_trades", 0)
+            self.drawdown_peak = data.get("drawdown_peak", 0.0)
+            self.current_drawdown = data.get("current_drawdown", 0.0)
+            self._trading_pause_until = data.get("trading_pause_until", 0.0)
 
-            # Restore active signals
-            for sym, rec_data in data.get("active_signals", {}).items():
+            # Restore pair cooldowns
+            for sym, cd_data in data.get("pair_cooldowns", {}).items():
+                if cd_data["cooldown_until"] > time.time():
+                    self._pair_cooldowns[sym] = PairCooldown(**cd_data)
+
+            # Restore narrative cooldowns
+            for narr, cd_data in data.get("narrative_cooldowns", {}).items():
+                if cd_data["cooldown_until"] > time.time():
+                    self._narrative_cooldowns[narr] = NarrativeCooldown(**cd_data)
+
+            # Restore recent trades (for ML training)
+            for t in data.get("recent_trades", []):
                 try:
-                    rec = SignalRecord(**rec_data)
-                    if rec.expires_at > time.time():  # not yet expired
-                        self._active_signals[sym] = rec
+                    self._closed_trades.append(TradeOutcome(**t))
                 except Exception:
                     pass
 
-            self._update_drawdown()
-            self._check_period_reset()
-            log.info(f"State loaded: balance=${self.current_balance_usdt:.2f}, dd={self.drawdown_pct:.1%}")
+            log.info(
+                f"State restored: daily_pnl={self.daily_pnl:.2f}, "
+                f"cons_losses={self.consecutive_losses}, "
+                f"pair_cooldowns={len(self._pair_cooldowns)}, "
+                f"state_age={age_hours:.1f}h"
+            )
 
         except Exception as e:
-            log.error(f"State load error: {e} — starting fresh")
-            self._reset_period_timestamps()
-
-    async def save(self):
-        try:
-            active = {}
-            for sym, rec in self._active_signals.items():
-                try:
-                    active[sym] = asdict(rec)
-                except Exception:
-                    pass
-
-            data = {
-                "current_balance_usdt": self.current_balance_usdt,
-                "peak_balance_usdt": self.peak_balance_usdt,
-                "consecutive_losses": self.consecutive_losses,
-                "last_loss_ts": self.last_loss_ts,
-                "kill_switch_active": self.kill_switch_active,
-                "total_signals": self.total_signals,
-                "total_wins": self.total_wins,
-                "total_losses": self.total_losses,
-                "day_start_ts": self._day_start_ts,
-                "week_start_ts": self._week_start_ts,
-                "month_start_ts": self._month_start_ts,
-                "daily_start_balance": self._daily_start_balance,
-                "weekly_start_balance": self._weekly_start_balance,
-                "monthly_start_balance": self._monthly_start_balance,
-                "active_signals": active,
-                "saved_at": time.time(),
-            }
-            with open(STATE_FILE, "w") as f:
-                json.dump(data, f, indent=2)
-            log.debug("State saved")
-        except Exception as e:
-            log.error(f"State save error: {e}")
+            log.warning(f"State restore error: {e} — starting fresh")
 
     # ═══════════════════════════════════════════
-    # SIGNAL MANAGEMENT
+    # STATE PERSISTENCE
     # ═══════════════════════════════════════════
 
-    def record_signal(self, signal):
-        """Register a newly generated signal."""
-        rec = SignalRecord(
-            symbol=signal.symbol,
-            direction=signal.direction,
-            grade=signal.grade,
-            signal_type=signal.signal_type,
-            entry_price=signal.entry_price,
-            sl_price=signal.sl_price,
-            tp1_price=signal.tp1_price,
-            risk_pct=signal.risk_pct,
-            risk_usdt=signal.risk_usdt,
-            size_usdt=signal.size_usdt,
-            generated_at=signal.generated_at,
-            expires_at=signal.expires_at,
-        )
-        self._active_signals[signal.symbol] = rec
-        self.total_signals += 1
-        log.info(f"Signal recorded: {signal.symbol} {signal.direction} {signal.grade}")
-
-    def close_signal(self, symbol: str, outcome: str, pnl_usdt: float):
-        """
-        Close a signal with outcome.
-        outcome: 'WIN' or 'LOSS'
-        """
-        rec = self._active_signals.pop(symbol, None)
-        if not rec:
+    async def _persist(self):
+        """Save critical state to Redis."""
+        if not self._redis:
             return
+        try:
+            data = {
+                "saved_at": time.time(),
+                "daily_pnl": self.daily_pnl,
+                "daily_loss_pct": self.daily_loss_pct,
+                "weekly_loss_pct": self.weekly_loss_pct,
+                "monthly_loss_pct": self.monthly_loss_pct,
+                "consecutive_losses": self.consecutive_losses,
+                "consecutive_wins": self.consecutive_wins,
+                "daily_trades": self.daily_trades,
+                "drawdown_peak": self.drawdown_peak,
+                "current_drawdown": self.current_drawdown,
+                "trading_pause_until": self._trading_pause_until,
+                "pair_cooldowns": {
+                    sym: asdict(cd)
+                    for sym, cd in self._pair_cooldowns.items()
+                    if cd.cooldown_until > time.time()
+                },
+                "narrative_cooldowns": {
+                    narr: asdict(cd)
+                    for narr, cd in self._narrative_cooldowns.items()
+                    if cd.cooldown_until > time.time()
+                },
+                "recent_trades": [
+                    asdict(t) for t in self._closed_trades[-50:]
+                ],
+            }
+            await self._redis.set(
+                "scalper_v4:state",
+                json.dumps(data),
+                ex=86400,  # 24h TTL
+            )
+            self._last_persist = time.time()
+        except Exception as e:
+            log.warning(f"State persist error: {e}")
 
-        rec.status = "HIT_TP1" if outcome == "WIN" else "HIT_SL"
-        rec.closed_at = time.time()
-        rec.pnl_usdt = pnl_usdt
-        self._signal_history.append(rec)
+    async def run(self):
+        """Background persistence loop."""
+        while not self._shutdown.is_set():
+            try:
+                if time.time() - self._last_persist >= self._persist_interval:
+                    await self._persist()
+                self._check_day_reset()
+            except Exception as e:
+                log.warning(f"State run error: {e}")
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=30)
+            except asyncio.TimeoutError:
+                pass
 
-        # Update balance
-        self.current_balance_usdt += pnl_usdt
-        self._update_drawdown()
-        self._update_period_pnl()
+    # ═══════════════════════════════════════════
+    # TRADE RECORDING
+    # ═══════════════════════════════════════════
 
-        if outcome == "WIN":
-            self.total_wins += 1
-            self.consecutive_losses = 0
+    async def record_trade_close(self, outcome: TradeOutcome):
+        """Record closed trade. Updates all risk counters. Persists immediately."""
+        async with self._lock:
+            self._closed_trades.append(outcome)
+            if len(self._closed_trades) > self._MAX_CLOSED_TRADES:
+                self._closed_trades = self._closed_trades[-self._MAX_CLOSED_TRADES:]
+
+            # Update PnL
+            self.daily_pnl += outcome.pnl_pct
+            self.daily_trades += 1
+
+            if outcome.pnl_pct < 0:
+                loss_abs = abs(outcome.pnl_pct)
+                self.daily_loss_pct += loss_abs
+                self.weekly_loss_pct += loss_abs
+                self.monthly_loss_pct += loss_abs
+                self.consecutive_losses += 1
+                self.consecutive_wins = 0
+
+                # Pair cooldown on SL hit
+                if outcome.outcome == "SL":
+                    await self._apply_pair_cooldown(
+                        outcome.symbol, "SL_HIT", outcome.narrative
+                    )
+            else:
+                self.consecutive_wins += 1
+                self.consecutive_losses = 0
+
+            # Drawdown tracking
+            if self.daily_pnl < 0:
+                self.current_drawdown = abs(self.daily_pnl)
+                if self.current_drawdown > self.drawdown_peak:
+                    self.drawdown_peak = self.current_drawdown
+
+            # Apply trading pause based on consecutive losses
+            rp = config.get_risk_profile()
+            if self.consecutive_losses >= 4:
+                pause = rp["cooldown_4loss_min"] * 60
+                self._trading_pause_until = time.time() + pause
+                log.warning(
+                    f"4 consecutive losses — pausing trading for {rp['cooldown_4loss_min']}min"
+                )
+            elif self.consecutive_losses == 3:
+                pause = rp["cooldown_3loss_min"] * 60
+                self._trading_pause_until = time.time() + pause
+            elif self.consecutive_losses == 2:
+                pause = rp["cooldown_2loss_min"] * 60
+                self._trading_pause_until = time.time() + pause
+
+        # Persist immediately after trade close (critical)
+        await self._persist()
+
+    async def _apply_pair_cooldown(
+        self, symbol: str, reason: str, narrative: str = ""
+    ):
+        """Apply cooldown to specific pair after SL hit."""
+        rp = config.get_risk_profile()
+        existing = self._pair_cooldowns.get(symbol)
+        loss_count = (existing.loss_count + 1) if existing else 1
+
+        # Longer cooldown for repeated failures
+        if loss_count >= 3:
+            cooldown_min = 120
+        elif loss_count >= 2:
+            cooldown_min = 60
         else:
-            self.total_losses += 1
-            self.consecutive_losses += 1
-            self.last_loss_ts = time.time()
+            cooldown_min = 30
 
-        log.info(f"Signal closed: {symbol} {outcome} PnL=${pnl_usdt:.2f}")
+        self._pair_cooldowns[symbol] = PairCooldown(
+            symbol=symbol,
+            reason=reason,
+            cooldown_until=time.time() + cooldown_min * 60,
+            loss_count=loss_count,
+        )
+        log.info(f"Pair cooldown: {symbol} for {cooldown_min}min (loss #{loss_count})")
 
-    def expire_old_signals(self):
-        """Remove signals past their expiry time."""
+        # Narrative cooldown if repeated failures in same category
+        if narrative:
+            narr_cd = self._narrative_cooldowns.get(narrative)
+            fails = (narr_cd.failure_count + 1) if narr_cd else 1
+            if fails >= 2:
+                narr_min = rp["narrative_cooldown_min"]
+                self._narrative_cooldowns[narrative] = NarrativeCooldown(
+                    narrative=narrative,
+                    failure_count=fails,
+                    cooldown_until=time.time() + narr_min * 60,
+                )
+                log.info(
+                    f"Narrative cooldown: {narrative} for {narr_min}min "
+                    f"({fails} failures)"
+                )
+
+    # ═══════════════════════════════════════════
+    # RISK CHECKS
+    # ═══════════════════════════════════════════
+
+    def can_trade(
+        self, symbol: str = None, narrative: str = None
+    ) -> Tuple[bool, str]:
+        """
+        Primary risk gate. Returns (can_trade, reason).
+        Called before any signal is generated.
+        """
         now = time.time()
-        expired = [sym for sym, rec in self._active_signals.items() if rec.expires_at < now]
-        for sym in expired:
-            rec = self._active_signals.pop(sym)
-            rec.status = "EXPIRED"
-            rec.closed_at = now
-            self._signal_history.append(rec)
-            log.debug(f"Signal expired: {sym}")
+        rp = config.get_risk_profile()
 
-    def get_active_signals(self) -> List[dict]:
-        self.expire_old_signals()
-        result = []
-        for sym, rec in self._active_signals.items():
-            result.append({
-                "symbol": rec.symbol,
-                "direction": rec.direction,
-                "grade": rec.grade,
-                "entry_price": rec.entry_price,
-                "generated_at": rec.generated_at,
-            })
-        return result
+        # Global pause
+        if self._trading_pause_until > now:
+            remaining = (self._trading_pause_until - now) / 60
+            return False, f"trading_paused_{remaining:.0f}min"
 
-    def has_active_signal(self, symbol: str) -> bool:
-        self.expire_old_signals()
-        return symbol in self._active_signals
+        # Daily loss limit
+        if self.daily_loss_pct >= rp["max_daily_loss"]:
+            return False, f"daily_loss_limit_{self.daily_loss_pct*100:.1f}%"
 
-    def count_active_positions(self) -> int:
-        self.expire_old_signals()
+        # Weekly loss limit
+        if self.weekly_loss_pct >= rp["max_weekly_loss"]:
+            return False, f"weekly_loss_limit_{self.weekly_loss_pct*100:.1f}%"
+
+        # Monthly absolute limit
+        if self.monthly_loss_pct >= config.ABS_MAX_MONTHLY_LOSS:
+            return False, "monthly_absolute_limit"
+
+        # Drawdown emergency
+        if self.current_drawdown >= config.DRAWDOWN_EMERGENCY:
+            return False, f"drawdown_emergency_{self.current_drawdown*100:.1f}%"
+
+        # Pair cooldown
+        if symbol:
+            cd = self._pair_cooldowns.get(symbol)
+            if cd and cd.cooldown_until > now:
+                remaining = (cd.cooldown_until - now) / 60
+                return False, f"pair_cooldown_{symbol}_{remaining:.0f}min"
+
+        # Narrative cooldown
+        if narrative:
+            cd = self._narrative_cooldowns.get(narrative)
+            if cd and cd.cooldown_until > now:
+                remaining = (cd.cooldown_until - now) / 60
+                return False, f"narrative_cooldown_{narrative}_{remaining:.0f}min"
+
+        return True, "ok"
+
+    def get_size_multiplier(self) -> float:
+        """Returns current position size multiplier based on drawdown state."""
+        if self.consecutive_losses >= 3:
+            return config.SIZE_REDUCTION_3
+        elif self.consecutive_losses >= 2:
+            return config.SIZE_REDUCTION_2
+
+        if self.current_drawdown >= config.DRAWDOWN_CRITICAL:
+            return 0.25
+        elif self.current_drawdown >= config.DRAWDOWN_SERIOUS:
+            return 0.50
+        elif self.current_drawdown >= config.DRAWDOWN_WARNING:
+            return 0.75
+
+        return 1.0
+
+    def get_active_positions_count(self) -> int:
         return len(self._active_signals)
 
-    # ═══════════════════════════════════════════
-    # BALANCE & DRAWDOWN
-    # ═══════════════════════════════════════════
+    def add_active_signal(self, symbol: str, signal):
+        self._active_signals[symbol] = signal
 
-    def update_balance(self, new_balance: float):
-        self.current_balance_usdt = new_balance
-        self._update_drawdown()
-        self._update_period_pnl()
+    def remove_active_signal(self, symbol: str):
+        self._active_signals.pop(symbol, None)
 
-    def _update_drawdown(self):
-        if self.current_balance_usdt > self.peak_balance_usdt:
-            self.peak_balance_usdt = self.current_balance_usdt
-        if self.peak_balance_usdt > 0:
-            self.drawdown_pct = max(
-                0, (self.peak_balance_usdt - self.current_balance_usdt) / self.peak_balance_usdt
-            )
-
-    def _update_period_pnl(self):
-        if self._daily_start_balance > 0:
-            self.daily_loss_pct = max(
-                0, (self._daily_start_balance - self.current_balance_usdt) / self._daily_start_balance
-            )
-        if self._weekly_start_balance > 0:
-            self.weekly_loss_pct = max(
-                0, (self._weekly_start_balance - self.current_balance_usdt) / self._weekly_start_balance
-            )
-        if self._monthly_start_balance > 0:
-            self.monthly_loss_pct = max(
-                0, (self._monthly_start_balance - self.current_balance_usdt) / self._monthly_start_balance
-            )
+    def has_active_signal(self, symbol: str) -> bool:
+        return symbol in self._active_signals
 
     # ═══════════════════════════════════════════
-    # PERIOD RESET
+    # ML DATA ACCESS
     # ═══════════════════════════════════════════
 
-    def _reset_period_timestamps(self):
-        now = time.time()
-        self._day_start_ts = now
-        self._week_start_ts = now
-        self._month_start_ts = now
-        self._daily_start_balance = self.current_balance_usdt
-        self._weekly_start_balance = self.current_balance_usdt
-        self._monthly_start_balance = self.current_balance_usdt
+    def get_last_n_closed(self, n: int = 50) -> List[TradeOutcome]:
+        return list(self._closed_trades[-n:])
 
-    def _check_period_reset(self):
-        now = time.time()
-        nowdt = datetime.fromtimestamp(now, tz=timezone.utc)
+    def get_win_rate(self, n: int = 50) -> float:
+        trades = self.get_last_n_closed(n)
+        if not trades:
+            return 0.5
+        wins = sum(1 for t in trades if t.pnl_pct > 0)
+        return wins / len(trades)
 
-        # Day reset
-        if now - self._day_start_ts >= 86400:
-            self._day_start_ts = now
-            self._daily_start_balance = self.current_balance_usdt
-            self.daily_loss_pct = 0.0
-            log.info("Daily P&L reset")
-
-        # Week reset (Monday UTC)
-        if nowdt.weekday() == 0 and now - self._week_start_ts >= 86400 * 6:
-            self._week_start_ts = now
-            self._weekly_start_balance = self.current_balance_usdt
-            self.weekly_loss_pct = 0.0
-            log.info("Weekly P&L reset")
-
-        # Month reset
-        if nowdt.day == 1 and now - self._month_start_ts >= 86400 * 27:
-            self._month_start_ts = now
-            self._monthly_start_balance = self.current_balance_usdt
-            self.monthly_loss_pct = 0.0
-            log.info("Monthly P&L reset")
+    def get_avg_rr(self, n: int = 50) -> float:
+        trades = self.get_last_n_closed(n)
+        if not trades:
+            return 1.0
+        return sum(t.pnl_r for t in trades) / len(trades)
 
     # ═══════════════════════════════════════════
-    # SCAN TRACKING
+    # STATUS SUMMARY
     # ═══════════════════════════════════════════
 
-    def update_scan(self, scan_count: int, signals_found: int):
-        self.scan_count = scan_count
-        self._check_period_reset()
-
-    # ═══════════════════════════════════════════
-    # STATS
-    # ═══════════════════════════════════════════
-
-    def get_stats(self) -> dict:
-        total_closed = self.total_wins + self.total_losses
-        win_rate = self.total_wins / total_closed if total_closed > 0 else 0.0
-        uptime_h = (time.time() - self._started_at) / 3600
-
+    def get_status_summary(self) -> dict:
+        rp = config.get_risk_profile()
         return {
-            "balance": round(self.current_balance_usdt, 2),
-            "peak": round(self.peak_balance_usdt, 2),
-            "drawdown": f"{self.drawdown_pct:.1%}",
-            "daily_loss": f"{self.daily_loss_pct:.1%}",
-            "weekly_loss": f"{self.weekly_loss_pct:.1%}",
-            "total_signals": self.total_signals,
-            "wins": self.total_wins,
-            "losses": self.total_losses,
-            "win_rate": f"{win_rate:.1%}",
+            "daily_pnl": f"{self.daily_pnl*100:+.2f}%",
+            "daily_loss": f"{self.daily_loss_pct*100:.2f}% / {rp['max_daily_loss']*100:.0f}%",
+            "weekly_loss": f"{self.weekly_loss_pct*100:.2f}% / {rp['max_weekly_loss']*100:.0f}%",
             "consecutive_losses": self.consecutive_losses,
-            "active": self.count_active_positions(),
-            "scan_count": self.scan_count,
-            "uptime_h": round(uptime_h, 1),
-            "kill_switch": self.kill_switch_active,
+            "active_signals": len(self._active_signals),
+            "size_mult": f"{self.get_size_multiplier():.0%}",
+            "pair_cooldowns": len([
+                c for c in self._pair_cooldowns.values()
+                if c.cooldown_until > time.time()
+            ]),
+            "narrative_cooldowns": len([
+                c for c in self._narrative_cooldowns.values()
+                if c.cooldown_until > time.time()
+            ]),
+            "trading_paused": self._trading_pause_until > time.time(),
+            "drawdown": f"{self.current_drawdown*100:.2f}%",
         }
+
+    # ═══════════════════════════════════════════
+    # DAY RESET
+    # ═══════════════════════════════════════════
+
+    def _check_day_reset(self):
+        now = time.time()
+        day_start = self._get_day_start()
+        if day_start > self._day_start_ts:
+            log.info("New UTC day — resetting daily counters")
+            self.daily_pnl = 0.0
+            self.daily_loss_pct = 0.0
+            self.daily_trades = 0
+            self.consecutive_losses = 0
+            self.consecutive_wins = 0
+            self.current_drawdown = 0.0
+            self._day_start_ts = day_start
+
+        week_start = self._get_week_start()
+        if week_start > self._week_start_ts:
+            log.info("New UTC week — resetting weekly counters")
+            self.weekly_loss_pct = 0.0
+            self._week_start_ts = week_start
+
+    @staticmethod
+    def _get_day_start() -> float:
+        now = datetime.now(timezone.utc)
+        return now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+    @staticmethod
+    def _get_week_start() -> float:
+        now = datetime.now(timezone.utc)
+        days_since_monday = now.weekday()
+        monday = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return (monday.timestamp() - days_since_monday * 86400)
+
+    async def close(self):
+        self._shutdown.set()
+        await self._persist()  # Final save on shutdown
